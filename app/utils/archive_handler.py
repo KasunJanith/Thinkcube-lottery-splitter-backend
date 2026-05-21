@@ -3,7 +3,7 @@ import rarfile
 import os
 
 def is_valid_archive(file_path: str) -> bool:
-    """Check if file is a valid ZIP or RAR archive."""
+    
     if zipfile.is_zipfile(file_path):
         return True
     if rarfile.is_rarfile(file_path):

@@ -19,6 +19,9 @@ class LotteryInfo(BaseModel):
     draw_number: str
     file_name: str
     record_count: int
+    serial_field_used: str | None = None   # e.g., "CODE" or "PRN_CODE"
+    start_serial: str | None = None        # first serial value
+    end_serial: str | None = None          # last serial value
 
 class UploadResponse(BaseModel):
     success: bool
@@ -28,11 +31,7 @@ class UploadResponse(BaseModel):
 
 @router.post("/upload-dbf-archive", response_model=UploadResponse)
 async def upload_dbf_archive(file: UploadFile = File(...)):
-    """
-    Upload a ZIP/RAR archive containing exactly 8 DBF files.
-    Files must be named like: <lottery_name><draw_number>.dbf
-    Returns identification and record count for each lottery.
-    """
+   
     import time
     start_time = time.time()
 
