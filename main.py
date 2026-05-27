@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.routers import upload
+from app.routers import upload, split
 
 app = FastAPI(
     title="DBF Splitter & Excel Exporter",
@@ -14,3 +14,5 @@ app.include_router(upload.router, prefix="/api/v1", tags=["upload"])
 @app.get("/")
 async def root():
     return {"message": "DBF Extractor API is running"}
+
+app.include_router(split.router, prefix="/api/v1", tags=["split"])

@@ -8,3 +8,6 @@ ALLOWED_EXTENSIONS = {".zip", ".rar"}
 
 # Expected number of DBF files inside the archive
 EXPECTED_DBF_COUNT = 8
+
+# Where extracted DBF files are stored for future operations
+STORAGE_BASE = os.path.join(os.path.dirname(__file__), "..", "storage")
