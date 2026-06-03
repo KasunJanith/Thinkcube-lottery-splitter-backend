@@ -14,7 +14,9 @@ def _get_serial_field(dbf_obj: DBF) -> str:
         for field in dbf_obj.fields:
             if field.name.lower() == candidate and field.length == SERIAL_LENGTH:
                 return field.name
-    raise ValueError(f"No serial field found (looked for {SERIAL_CANDIDATE_FIELDS} with length {SERIAL_LENGTH}).")
+    raise ValueError(
+        f"No serial field found (looked for {SERIAL_CANDIDATE_FIELDS} with length {SERIAL_LENGTH})."
+    )
 
 
 def _write_dbf(
@@ -34,6 +36,7 @@ def _write_dbf(
     new.open(dbf.READ_WRITE)
     if records:
         for rec in records:
+            # ensure all expected fields are present (fill missing with None)
             row = {name: rec.get(name) for name in field_names}
             new.append(row)
     new.close()
@@ -105,4 +108,50 @@ def split_dbf_by_agents(
         "total_records": total_records,
         "assigned_records": assigned_records,
         "remaining_records": remaining_records,
+    }
+
+
+def split_single_lottery_for_agent(
+    input_path: str,
+    output_path: str,
+    count: int,
+    serial_field: str,
+) -> dict:
+    """
+    Split a single lottery DBF file for one agent, extracting the first `count` records
+    (sorted by serial). Returns a dict with start_serial, end_serial, record_count.
+    """
+    dbf_obj = DBF(input_path, encoding='utf-8')
+
+    # Read and sort records by the serial field
+    records = []
+    for rec in dbf_obj:
+        serial = rec.get(serial_field, '').strip()
+        records.append((serial, rec))
+    if not records:
+        raise ValueError("DBF file is empty.")
+    records.sort(key=lambda x: x[0])
+
+    if len(records) < count:
+        raise ValueError(f"Not enough records: requested {count}, available {len(records)}")
+
+    chunk = records[:count]
+    start_serial = chunk[0][0]
+    end_serial = chunk[-1][0]
+
+    # Write the chunk to a new DBF file, using source structure
+    source = dbf.Table(input_path)
+    source.open(dbf.READ_ONLY)
+    new = source.new(output_path)
+    new.open(dbf.READ_WRITE)
+    for _, rec in chunk:
+        row = {name: rec.get(name) for name in dbf_obj.field_names}
+        new.append(row)
+    new.close()
+    source.close()
+
+    return {
+        "start_serial": start_serial,
+        "end_serial": end_serial,
+        "record_count": len(chunk),
     }
