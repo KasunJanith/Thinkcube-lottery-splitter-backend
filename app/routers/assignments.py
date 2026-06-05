@@ -19,13 +19,12 @@ class AssignmentRequest(BaseModel):
 
 @router.post("/assignments")
 def save_assignments(request: AssignmentRequest, db: Session = Depends(get_db)):
-    # Delete existing assignments for that date
+    # Clear previous assignments for that date
     db.query(Assignment).filter(Assignment.assignment_date == request.assignment_date).delete()
     for item in request.assignments:
         agent = db.query(Agent).filter_by(name=item.agent_name).first()
         if not agent:
             raise HTTPException(400, f"Agent {item.agent_name} not found")
-        # Optionally check that order exists and total assigned <= quantity
         assignment = Assignment(
             assignment_date=request.assignment_date,
             lottery_code=item.lottery_code,
@@ -42,7 +41,6 @@ def get_assignments(assignment_date: date, db: Session = Depends(get_db)):
     agents = db.query(Agent).all()
     lottery_types = db.query(LotteryType).all()
     orders = db.query(Order).filter(Order.order_date == assignment_date).all()
-    # Build response: for each lottery, show available quantity and per-agent assigned
     result = []
     for lt in lottery_types:
         order = next((o for o in orders if o.lottery_code == lt.code), None)

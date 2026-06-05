@@ -3,61 +3,45 @@ import shutil
 import tempfile
 import uuid
 import logging
-from fastapi import APIRouter, File, UploadFile, HTTPException
-from pydantic import BaseModel
-
+from datetime import datetime, date as dateType
+from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query
+from sqlalchemy.orm import Session
 from app.config import MAX_UPLOAD_SIZE, EXPECTED_DBF_COUNT, ALLOWED_EXTENSIONS, STORAGE_BASE
+from app.database import get_db
 from app.utils.archive_handler import extract_archive, is_valid_archive
 from app.utils.dbf_handler import process_dbf_files
+from app.models import Session as DbSession, LotteryFile, LotteryType
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# --- Response Models ---
-class LotteryInfo(BaseModel):
-    lottery_name: str
-    draw_number: str
-    file_name: str
-    record_count: int
-    serial_field_used: str | None = None
-    start_serial: str | None = None
-    end_serial: str | None = None
+def extract_date_from_zip_filename(filename: str):
+    """Try to extract a YYYY-MM-DD date from a filename like '2026 06 05 DBS.zip'."""
+    parts = filename.replace('.zip', '').replace('.ZIP', '').split()
+    if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
+        try:
+            return f"{parts[0]}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
+        except:
+            pass
+    return None
 
 
-class UploadResponse(BaseModel):
-    success: bool
-    session_id: str
-    total_lotteries: int
-    lotteries: list[LotteryInfo]
-
-
-# --- Endpoint ---
-@router.post("/upload-dbf-archive", response_model=UploadResponse)
-async def upload_dbf_archive(file: UploadFile = File(...)):
-    """
-    Upload a ZIP/RAR archive containing exactly 8 DBF files.
-    Files must be named like: <lottery_name><draw_number>.dbf
-    Returns identification, record count, serial range, and a session ID.
-    """
-    # 1. Basic validation
+@router.post("/upload-dbf-archive")
+async def upload_dbf_archive(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Upload a ZIP/RAR containing exactly 8 DBF files, store them, and link to a date."""
+    # --- 1. Basic validation (unchanged) ---
     if not file:
         raise HTTPException(status_code=400, detail="No file uploaded.")
     if file.size and file.size > MAX_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Max allowed size is {MAX_UPLOAD_SIZE // (1024*1024)} MB.",
-        )
+        raise HTTPException(status_code=413, detail=f"File too large. Max {MAX_UPLOAD_SIZE // (1024*1024)} MB.")
 
     original_filename = file.filename or "unknown"
     ext = os.path.splitext(original_filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type '{ext}'. Only {', '.join(ALLOWED_EXTENSIONS)} are allowed.",
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid file type '{ext}'.")
 
-    # 2. Save uploaded archive to a temporary file
+    # --- 2. Save uploaded archive to temp ---
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
             content = await file.read()
@@ -67,21 +51,20 @@ async def upload_dbf_archive(file: UploadFile = File(...)):
         logger.error(f"Failed to save uploaded file: {e}")
         raise HTTPException(status_code=500, detail="Failed to save uploaded file.")
 
-    # 3. Temporary extraction directory + session storage
     tmp_dir = tempfile.mkdtemp(prefix="dbf_extract_")
     session_id = str(uuid.uuid4())
     session_storage = os.path.join(STORAGE_BASE, session_id)
 
     try:
-        # 4. Validate archive and extract
+        # --- 3. Validate & extract archive ---
         if not is_valid_archive(archive_path):
-            raise HTTPException(status_code=400, detail="Uploaded file is not a valid ZIP or RAR archive.")
+            raise HTTPException(status_code=400, detail="Invalid ZIP or RAR archive.")
         extract_archive(archive_path, tmp_dir)
 
-        # 5. Process DBF files (validation, record counts, serial ranges)
+        # --- 4. Process DBF files (counts, serials) ---
         lottery_list = process_dbf_files(tmp_dir, expected_count=EXPECTED_DBF_COUNT)
 
-        # 6. Persist DBF files to session storage for later splitting
+        # --- 5. Persist DBF files to session storage ---
         os.makedirs(session_storage, exist_ok=True)
         for root, dirs, files in os.walk(tmp_dir):
             for f in files:
@@ -90,28 +73,97 @@ async def upload_dbf_archive(file: UploadFile = File(...)):
                     dst = os.path.join(session_storage, f)
                     shutil.copy2(src, dst)
 
-        # 7. Return success
-        return UploadResponse(
-            success=True,
-            session_id=session_id,
-            total_lotteries=len(lottery_list),
-            lotteries=lottery_list,
+        # --- 6. Extract date from ZIP filename ---
+        zip_date_str = extract_date_from_zip_filename(original_filename)
+        session_date = None
+        if zip_date_str:
+            try:
+                session_date = datetime.strptime(zip_date_str, "%Y-%m-%d").date()
+            except ValueError:
+                pass
+
+        # --- 7. Store session and lottery file records in DB ---
+        session_obj = DbSession(
+            id=session_id,
+            original_filename=original_filename,
+            session_date=session_date
         )
+        db.add(session_obj)
+
+        for lt in lottery_list:
+            db.add(LotteryFile(
+                session_id=session_id,
+                lottery_name=lt["lottery_name"],
+                draw_number=lt["draw_number"],
+                original_filename=lt["file_name"],
+                record_count=lt["record_count"],
+                start_serial=lt["start_serial"],
+                end_serial=lt["end_serial"],
+                serial_field=lt["serial_field_used"],
+                stored_path=os.path.join(session_storage, lt["file_name"])
+            ))
+        db.commit()
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "total_lotteries": len(lottery_list),
+            "lotteries": lottery_list,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Unexpected error during archive processing")
-        raise HTTPException(status_code=500, detail=f"Internal processing error: {str(e)}")
+        logger.exception("Unexpected error during upload")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
     finally:
-        # Cleanup temporary files
-        try:
-            if os.path.exists(archive_path):
-                os.unlink(archive_path)
-        except Exception as e:
-            logger.warning(f"Could not delete temp archive {archive_path}: {e}")
-        try:
-            if os.path.exists(tmp_dir):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception as e:
-            logger.warning(f"Could not delete temp directory {tmp_dir}: {e}")
+        # Cleanup temp files
+        if os.path.exists(archive_path):
+            os.unlink(archive_path)
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------
+# NEW ENDPOINTS for Split page
+# ----------------------------------------------------------------------
+
+@router.get("/sessions/by-date")
+def get_session_by_date(date: str = Query(...), db: Session = Depends(get_db)):
+    """Return the most recent session_id for a given date, or null."""
+    try:
+        qdate = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format (use YYYY-MM-DD).")
+    try:
+        session = (
+            db.query(DbSession)
+            .filter(DbSession.session_date == qdate)
+            .order_by(DbSession.uploaded_at.desc())
+            .first()
+        )
+        return {"session_id": session.id if session else None}
+    except Exception as e:
+        logger.error(f"Database query error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@router.get("/sessions/{session_id}/lotteries")
+def get_session_lotteries(session_id: str, db: Session = Depends(get_db)):
+    """Return all lottery files attached to a session."""
+    sess = db.query(DbSession).filter(DbSession.id == session_id).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    lotteries = db.query(LotteryFile).filter(LotteryFile.session_id == session_id).all()
+    result = []
+    for lf in lotteries:
+        # Optional: look up display name from LotteryType
+        lt = db.query(LotteryType).filter_by(code=lf.lottery_name).first()
+        result.append({
+            "lottery_name": lf.lottery_name,
+            "draw_number": lf.draw_number,
+            "record_count": lf.record_count,
+            "start_serial": lf.start_serial,
+            "end_serial": lf.end_serial,
+        })
+    return result
