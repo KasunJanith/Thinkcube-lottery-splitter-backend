@@ -27,13 +27,13 @@ def init_db():
             
     # Seed draw number bases for June 1, 2026
     draw_bases = [
-        ("ada", date(2026,6,1), "4447"),
-        ("dana", date(2026,6,1), "6205"),
-        ("govi", date(2026,6,1), "2553"),
-        ("hada", date(2026,6,1), "2235"),
-        ("jaya", date(2026,6,1), "1514"),
-        ("maha", date(2026,6,1), "0780"),
-        ("mgap", date(2026,6,1), "0473"),
+        ("ada", date(2026,6,1), "0780"),
+        ("dana", date(2026,6,1), "2235"),
+        ("govi", date(2026,6,1), "4447"),
+        ("hada", date(2026,6,1), "1514"),
+        ("jaya", date(2026,6,1), "0473"),
+        ("maha", date(2026,6,1), "6205"),
+        ("mgap", date(2026,6,1), "2553"),
         ("suba", date(2026,6,1), "0321"),
     ]
     for code, bdate, bnumber in draw_bases:

@@ -32,26 +32,29 @@ def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):
     if not agent:
         raise HTTPException(404, "Agent not found")
 
-    # 3. Validate ZIP filename date matches assignment date
+    # 3. Parse assignment_date from string to date object
+    try:
+        assignment_date = datetime.strptime(request.assignment_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid assignment_date format. Expected YYYY-MM-DD")
+
+    # 4. Validate ZIP filename date matches assignment date
     if request.zip_filename:
-        # Extract date from filename (e.g., "2026 05 21 DBS.zip" -> "2026-05-21")
+        # Extract date from filename (e.g., "2026 06 05 DBS.zip" -> "2026-06-05")
         try:
-            parts = request.zip_filename.replace('.zip', '').split()
-            # Expected parts: ['2026', '05', '21', 'DBS']
+            parts = request.zip_filename.replace('.zip', '').replace('.rar', '').split()
+            # Expected parts: ['2026', '06', '05', 'DBS']
             if len(parts) >= 3:
                 year, month, day = parts[0], parts[1], parts[2]
                 file_date = date(int(year), int(month), int(day))
-                assignment_date = datetime.strptime(request.assignment_date, "%Y-%m-%d").date()
                 if file_date != assignment_date:
                     raise HTTPException(400, f"ZIP file date ({file_date}) does not match assignment date ({assignment_date})")
             else:
                 raise HTTPException(400, "ZIP filename does not match expected format 'YYYY MM DD ...'")
-        except ValueError:
-            raise HTTPException(400, "Could not parse date from ZIP filename")
-
-    # 4. Get assignments for this agent on this date
+        except ValueError as e:
+            raise HTTPException(400, f"Could not parse date from ZIP filename: {str(e)}")    # 5. Get assignments for this agent on this date
     assignments = db.query(Assignment).filter(
-        Assignment.assignment_date == request.assignment_date,
+        Assignment.assignment_date == assignment_date,
         Assignment.agent_id == agent.id
     ).all()
     if not assignments:
@@ -79,7 +82,14 @@ def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):
         ).first()
         if not dbf_file:
             raise HTTPException(400, f"DBF file not found for {assignment.lottery_code} draw {order.draw_number}")
-
+        existing_split = db.query(AgentSplit).filter(
+            AgentSplit.session_id == request.session_id,
+            AgentSplit.agent_id == agent.id,
+            AgentSplit.lottery_code == assignment.lottery_code,
+            AgentSplit.draw_number == order.draw_number
+            ).first()
+        if existing_split:
+            raise HTTPException(409, f"Already split {assignment.lottery_code} draw {order.draw_number} for {agent.name}")
         # Split: take first assigned_count records
         input_path = dbf_file.stored_path
         output_filename = f"{assignment.lottery_code}_{order.draw_number}_{agent.name}.dbf"
@@ -146,7 +156,45 @@ def get_assigned_counts(
             "available_quantity": order.quantity if order else 0,
         })
     return result
+@router.get("/splits-by-date")
+def list_splits_by_date(
+    agent_name: str = Query(...),
+    date: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    agent = db.query(Agent).filter(Agent.name == agent_name).first()
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    try:
+        qdate = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid date format (YYYY-MM-DD)")
 
+    splits = (
+        db.query(AgentSplit)
+        .join(Session, AgentSplit.session_id == Session.id)
+        .filter(
+            AgentSplit.agent_id == agent.id,
+            Session.session_date == qdate
+        )
+        .all()
+    )
+
+    result = []
+    for s in splits:
+        lt = db.query(LotteryType).filter_by(code=s.lottery_code).first()
+        result.append({
+            "lottery_code": s.lottery_code,
+            "lottery_name": lt.name if lt else s.lottery_code,
+            "draw_number": s.draw_number,
+            "start_serial": s.start_serial,
+            "end_serial": s.end_serial,
+            "record_count": s.record_count,
+            "filename": os.path.basename(s.saved_file_path),   # <-- add this
+            "download_url": f"/api/v1/download-file/{os.path.basename(s.saved_file_path)}?session={s.session_id}",
+            "session_id": s.session_id,
+        })
+    return result
 
 # --- Download endpoints (unchanged) ---
 @router.get("/agent-splits/{session_id}/{agent_name}")
@@ -202,3 +250,22 @@ def download_agent_zip(session_id: str, agent_name: str, db: Session = Depends(g
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={agent_name}_splits.zip"}
     )
+
+
+@router.get("/split-dates/{agent_name}")
+def get_split_dates(agent_name: str, db: Session = Depends(get_db)):
+    """Get all dates that have splits for a specific agent"""
+    agent = db.query(Agent).filter(Agent.name == agent_name).first()
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    
+    # Get all unique session_dates that have splits for this agent
+    splits = db.query(AgentSplit, Session.session_date).join(
+        Session, AgentSplit.session_id == Session.id
+    ).filter(
+        AgentSplit.agent_id == agent.id,
+        Session.session_date.isnot(None)
+    ).distinct().all()
+    
+    dates = [str(s[1]) for s in splits]  # Convert dates to strings
+    return {"dates": sorted(list(set(dates)))}  # Remove duplicates and sort
