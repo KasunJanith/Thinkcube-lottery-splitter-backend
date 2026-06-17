@@ -156,6 +156,121 @@ def get_assigned_counts(
             "available_quantity": order.quantity if order else 0,
         })
     return result
+@router.get("/validate-upload")
+def validate_upload(
+    date: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    """Compare uploaded DBF record counts against ordered quantities for a date."""
+    try:
+        selected_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid date format (YYYY-MM-DD)")
+
+    # Get the session for this date
+    session = db.query(Session).filter(
+        Session.session_date == selected_date
+    ).order_by(Session.uploaded_at.desc()).first()
+
+    if not session:
+        return {
+            "upload_exists": False,
+            "message": "No archive uploaded for this date.",
+            "mismatches": [],
+            "missing_lotteries": [],
+            "extra_lotteries": [],
+            "is_valid": False
+        }
+
+    # Get uploaded files
+    uploaded_files = db.query(LotteryFile).filter(
+        LotteryFile.session_id == session.id
+    ).all()
+
+    # Get orders for this date
+    orders = db.query(Order).filter(
+        Order.order_date == selected_date
+    ).all()
+
+    # Build lookup dictionaries
+    uploaded_dict = {}
+    for uf in uploaded_files:
+        lt = db.query(LotteryType).filter_by(code=uf.lottery_name).first()
+        uploaded_dict[uf.lottery_name] = {
+            "lottery_code": uf.lottery_name,
+            "lottery_name": lt.name if lt else uf.lottery_name,
+            "draw_number": uf.draw_number,
+            "record_count": uf.record_count,
+            "start_serial": uf.start_serial,
+            "end_serial": uf.end_serial
+        }
+
+    order_dict = {}
+    for o in orders:
+        lt = db.query(LotteryType).filter_by(code=o.lottery_code).first()
+        order_dict[o.lottery_code] = {
+            "lottery_code": o.lottery_code,
+            "lottery_name": lt.name if lt else o.lottery_code,
+            "draw_number": o.draw_number,
+            "quantity": o.quantity
+        }
+
+    mismatches = []
+    missing_lotteries = []
+    extra_lotteries = []
+
+    # Check each uploaded file against orders
+    for code, upload in uploaded_dict.items():
+        if code in order_dict:
+            order = order_dict[code]
+            draw_mismatch = upload["draw_number"] != order["draw_number"]
+            count_mismatch = upload["record_count"] != order["quantity"]
+            
+            if draw_mismatch or count_mismatch:
+                mismatches.append({
+                    "lottery_code": code,
+                    "lottery_name": upload["lottery_name"],
+                    "ordered_draw": order["draw_number"],
+                    "uploaded_draw": upload["draw_number"],
+                    "draw_match": not draw_mismatch,
+                    "ordered_quantity": order["quantity"],
+                    "uploaded_records": upload["record_count"],
+                    "count_match": not count_mismatch,
+                    "difference": upload["record_count"] - order["quantity"]
+                })
+        else:
+            extra_lotteries.append({
+                "lottery_code": code,
+                "lottery_name": upload["lottery_name"],
+                "record_count": upload["record_count"]
+            })
+
+    # Check for orders without uploaded files
+    for code, order in order_dict.items():
+        if code not in uploaded_dict:
+            missing_lotteries.append({
+                "lottery_code": code,
+                "lottery_name": order["lottery_name"],
+                "quantity": order["quantity"]
+            })
+
+    is_valid = len(mismatches) == 0 and len(missing_lotteries) == 0 and len(extra_lotteries) == 0
+
+    return {
+        "upload_exists": True,
+        "session_id": session.id,
+        "is_valid": is_valid,
+        "mismatches": mismatches,
+        "missing_lotteries": missing_lotteries,
+        "extra_lotteries": extra_lotteries,
+        "summary": {
+            "total_uploaded": len(uploaded_files),
+            "total_ordered": len(orders),
+            "total_mismatches": len(mismatches),
+            "total_missing": len(missing_lotteries),
+            "total_extra": len(extra_lotteries)
+        }
+    }
 @router.get("/splits-by-date")
 def list_splits_by_date(
     agent_name: str = Query(...),

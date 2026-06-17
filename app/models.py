@@ -83,3 +83,34 @@ class AgentSplit(Base):
     record_count = Column(Integer)
     saved_file_path = Column(String(500))
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+class WinningSession(Base):
+    __tablename__ = "winning_sessions"
+    id = Column(String(36), primary_key=True)
+    original_filename = Column(String(255))
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    session_date = Column(Date, nullable=False)
+    status = Column(String(20), default="extracted")   # extracted, validated, split
+
+class WinningFile(Base):
+    __tablename__ = "winning_files"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(36), ForeignKey("winning_sessions.id"))
+    lottery_code = Column(String(10))
+    draw_number = Column(String(20))
+    original_filename = Column(String(100))
+    record_count = Column(Integer)
+    total_price = Column(Float, default=0.0)
+    stored_path = Column(String(500))
+
+class AgentWinningSplit(Base):
+    __tablename__ = "agent_winning_splits"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    winning_session_id = Column(String(36), ForeignKey("winning_sessions.id"))
+    agent_id = Column(Integer, ForeignKey("agents.id"))
+    lottery_code = Column(String(10))
+    draw_number = Column(String(20))
+    record_count = Column(Integer)
+    total_price = Column(Float, default=0.0)
+    saved_file_path = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)

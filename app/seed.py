@@ -9,12 +9,12 @@ def init_db():
     lotteries = [
         ("ada", "Ada Sampatha"),
         ("dana", "Dhana Nidhanaya"),
-        ("govi", "Govi Setha"),
-        ("hada", "Handahana"),
-        ("jaya", "NLB Jaya"),
-        ("maha", "Mahajana Sampatha"),
+        ("GOVI", "Govi Setha"),
+        ("HADA", "Handahana"),
+        ("Jaya", "NLB Jaya"),
+        ("Maha", "Mahajana Sampatha"),
         ("mgap", "Mega Power"),
-        ("suba", "Suba Dawasak"),
+        ("SUBA", "Suba Dawasak"),
     ]
     for code, name in lotteries:
         if not db.query(LotteryType).filter_by(code=code).first():
@@ -29,12 +29,12 @@ def init_db():
     draw_bases = [
         ("ada", date(2026,6,1), "0780"),
         ("dana", date(2026,6,1), "2235"),
-        ("govi", date(2026,6,1), "4447"),
-        ("hada", date(2026,6,1), "1514"),
-        ("jaya", date(2026,6,1), "0473"),
-        ("maha", date(2026,6,1), "6205"),
+        ("GOVI", date(2026,6,1), "4447"),
+        ("HADA", date(2026,6,1), "1514"),
+        ("Jaya", date(2026,6,1), "0473"),
+        ("Maha", date(2026,6,1), "6205"),
         ("mgap", date(2026,6,1), "2553"),
-        ("suba", date(2026,6,1), "0321"),
+        ("SUBA", date(2026,6,1), "0321"),
     ]
     for code, bdate, bnumber in draw_bases:
         existing = db.query(DrawNumberBase).filter_by(lottery_code=code).first()
