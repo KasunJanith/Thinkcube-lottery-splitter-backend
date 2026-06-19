@@ -39,6 +39,8 @@ def init_db():
     for code, bdate, bnumber in draw_bases:
         existing = db.query(DrawNumberBase).filter_by(lottery_code=code).first()
         if not existing:
-            db.add(DrawNumberBase(lottery_code=code, base_date=bdate, base_draw_number=bnumber))        
+            db.add(DrawNumberBase(lottery_code=code, base_date=bdate, base_draw_number=bnumber))     
+            
+               
     db.commit()
     db.close()

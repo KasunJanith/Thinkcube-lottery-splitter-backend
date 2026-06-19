@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from app.database import get_db
 from app.models import Session, LotteryFile, AgentSplit, Agent, Assignment, Order, LotteryType
-from app.utils.dbf_splitter import split_single_lottery_for_agent
+from app.utils.dbf_splitter import split_single_lottery_for_agent, _get_serial_field
 from app.config import STORAGE_BASE
 
 router = APIRouter()
@@ -17,96 +17,132 @@ router = APIRouter()
 class SplitRequest(BaseModel):
     session_id: str
     agent_name: str
-    assignment_date: str       # "YYYY-MM-DD"
-    zip_filename: Optional[str] = None   # original zip filename, e.g., "2026 05 21 DBS.zip"
+    assignment_date: str
+    zip_filename: Optional[str] = None
 
 @router.post("/split-for-agent")
 def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):
-    # 1. Validate session
+    # --- Validate session, agent, date (same as before) ---
     session = db.query(Session).filter(Session.id == request.session_id).first()
     if not session:
         raise HTTPException(404, "Session not found")
 
-    # 2. Verify agent exists
     agent = db.query(Agent).filter(Agent.name == request.agent_name).first()
     if not agent:
         raise HTTPException(404, "Agent not found")
 
-    # 3. Parse assignment_date from string to date object
     try:
         assignment_date = datetime.strptime(request.assignment_date, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(400, "Invalid assignment_date format. Expected YYYY-MM-DD")
 
-    # 4. Validate ZIP filename date matches assignment date
     if request.zip_filename:
-        # Extract date from filename (e.g., "2026 06 05 DBS.zip" -> "2026-06-05")
         try:
             parts = request.zip_filename.replace('.zip', '').replace('.rar', '').split()
-            # Expected parts: ['2026', '06', '05', 'DBS']
             if len(parts) >= 3:
-                year, month, day = parts[0], parts[1], parts[2]
-                file_date = date(int(year), int(month), int(day))
+                file_date = date(int(parts[0]), int(parts[1]), int(parts[2]))
                 if file_date != assignment_date:
                     raise HTTPException(400, f"ZIP file date ({file_date}) does not match assignment date ({assignment_date})")
-            else:
-                raise HTTPException(400, "ZIP filename does not match expected format 'YYYY MM DD ...'")
         except ValueError as e:
-            raise HTTPException(400, f"Could not parse date from ZIP filename: {str(e)}")    # 5. Get assignments for this agent on this date
-    assignments = db.query(Assignment).filter(
-        Assignment.assignment_date == assignment_date,
-        Assignment.agent_id == agent.id
-    ).all()
-    if not assignments:
-        raise HTTPException(400, "No assignments found for this agent/date")
+            raise HTTPException(400, f"Could not parse date from ZIP filename: {str(e)}")
 
-    # 5. Get orders (draw numbers)
+    # --- Get ALL assignments for this date (both agents) ---
+    all_assignments = db.query(Assignment).filter(
+        Assignment.assignment_date == assignment_date
+    ).all()
+    if not all_assignments:
+        raise HTTPException(400, "No assignments found for this date")
+
+    # Get agents and sort them to define the order (alphabetical: JAYAWAY, WINWAY)
+    agent_ids = {a.agent_id for a in all_assignments}
+    agents = db.query(Agent).filter(Agent.id.in_(agent_ids)).order_by(Agent.name).all()
+    agent_order = [ag.id for ag in agents]  # e.g., [JAYAWAY.id, WINWAY.id]
+
+    # Get orders (draw numbers)
     orders = db.query(Order).filter(Order.order_date == request.assignment_date).all()
     if not orders:
         raise HTTPException(400, "No orders found for this date")
 
-    # 6. Process each lottery
-    results = []
-    for assignment in assignments:
-        if assignment.assigned_count <= 0:
-            continue
-        order = next((o for o in orders if o.lottery_code == assignment.lottery_code), None)
-        if not order:
-            raise HTTPException(400, f"Draw number not found for lottery {assignment.lottery_code}")
+    # Group orders by lottery_code
+    order_map = {o.lottery_code: o for o in orders}
 
-        # Find the corresponding DBF file in the session
+    results = []
+
+    # Process each lottery
+    lottery_codes = set(a.lottery_code for a in all_assignments)
+    for lcode in lottery_codes:
+        order = order_map.get(lcode)
+        if not order:
+            raise HTTPException(400, f"Order not found for lottery {lcode}")
+
+        # Find the DBF file
         dbf_file = db.query(LotteryFile).filter(
             LotteryFile.session_id == request.session_id,
-            LotteryFile.lottery_name == assignment.lottery_code,
+            LotteryFile.lottery_name == lcode,
             LotteryFile.draw_number == order.draw_number
         ).first()
         if not dbf_file:
-            raise HTTPException(400, f"DBF file not found for {assignment.lottery_code} draw {order.draw_number}")
-        existing_split = db.query(AgentSplit).filter(
+            raise HTTPException(400, f"DBF file not found for {lcode} draw {order.draw_number}")
+
+        # Check if this specific agent already has a split for this lottery
+        existing = db.query(AgentSplit).filter(
             AgentSplit.session_id == request.session_id,
             AgentSplit.agent_id == agent.id,
-            AgentSplit.lottery_code == assignment.lottery_code,
+            AgentSplit.lottery_code == lcode,
             AgentSplit.draw_number == order.draw_number
-            ).first()
-        if existing_split:
-            raise HTTPException(409, f"Already split {assignment.lottery_code} draw {order.draw_number} for {agent.name}")
-        # Split: take first assigned_count records
-        input_path = dbf_file.stored_path
-        output_filename = f"{assignment.lottery_code}_{order.draw_number}_{agent.name}.dbf"
-        output_dir = os.path.join(STORAGE_BASE, request.session_id, "splits")
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, output_filename)
+        ).first()
+        if existing:
+            raise HTTPException(409, f"Already split {lcode} for {agent.name}")
 
-        part_info = split_single_lottery_for_agent(
-            input_path, output_path, assignment.assigned_count,
+        # --- Calculate the starting index for this agent ---
+        # Sum the assigned counts of all agents that come BEFORE this agent in sorted order
+        target_agent_index = agent_order.index(agent.id)
+        start_index = 0
+        for idx in range(target_agent_index):
+            earlier_agent_id = agent_order[idx]
+            earlier_assignment = next(
+                (a for a in all_assignments if a.lottery_code == lcode and a.agent_id == earlier_agent_id),
+                None
+            )
+            if earlier_assignment:
+                start_index += earlier_assignment.assigned_count
+
+        # This agent's own count
+        this_assignment = next(
+            (a for a in all_assignments if a.lottery_code == lcode and a.agent_id == agent.id),
+            None
+        )
+        if not this_assignment or this_assignment.assigned_count <= 0:
+            continue
+
+        count_to_split = this_assignment.assigned_count
+
+        # Safety: ensure we don't exceed file length
+        if start_index + count_to_split > dbf_file.record_count:
+            raise HTTPException(400, f"Not enough records for {agent.name} in {lcode}. "
+                                      f"Start {start_index} + count {count_to_split} exceeds total {dbf_file.record_count}")
+
+        # Now split using a helper that can start from an offset, not just the beginning
+        part_info = split_with_offset(
+            dbf_file.stored_path,
+            start_index,
+            count_to_split,
             dbf_file.serial_field
         )
 
-        # Save record in AgentSplit
+        # Save the new AgentSplit
+        output_dir = os.path.join(STORAGE_BASE, request.session_id, "splits")
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = f"{lcode}_{order.draw_number}_{agent.name}.dbf"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Write the chunk to DBF
+        _write_chunk_to_dbf(dbf_file.stored_path, output_path, part_info["records"])
+
         new_split = AgentSplit(
             session_id=request.session_id,
             agent_id=agent.id,
-            lottery_code=assignment.lottery_code,
+            lottery_code=lcode,
             draw_number=order.draw_number,
             start_serial=part_info["start_serial"],
             end_serial=part_info["end_serial"],
@@ -115,7 +151,7 @@ def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):
         )
         db.add(new_split)
         results.append({
-            "lottery_code": assignment.lottery_code,
+            "lottery_code": lcode,
             "start_serial": part_info["start_serial"],
             "end_serial": part_info["end_serial"],
             "record_count": part_info["record_count"]
@@ -123,6 +159,39 @@ def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):
 
     db.commit()
     return {"status": "split completed", "files": results}
+
+
+def split_with_offset(file_path: str, offset: int, count: int, serial_field: str) -> dict:
+    """Extract a slice of records from a DBF file, starting at `offset` (0-indexed)."""
+    from dbfread import DBF
+    dbf_obj = DBF(file_path, encoding='utf-8')
+    records = []
+    for rec in dbf_obj:
+        serial = rec.get(serial_field, '').strip()
+        records.append((serial, rec))
+    records.sort(key=lambda x: x[0])
+    if offset + count > len(records):
+        raise ValueError("Not enough records")
+    chunk = records[offset:offset + count]
+    return {
+        "start_serial": chunk[0][0],
+        "end_serial": chunk[-1][0],
+        "record_count": len(chunk),
+        "records": [r for _, r in chunk]   # actual record dicts
+    }
+
+
+def _write_chunk_to_dbf(source_path: str, output_path: str, records: list):
+    """Write a list of record dicts to a new DBF with the same structure as source."""
+    import dbf
+    source = dbf.Table(source_path)
+    source.open(dbf.READ_ONLY)
+    new = source.new(output_path)
+    new.open(dbf.READ_WRITE)
+    for rec in records:
+        new.append(rec)
+    new.close()
+    source.close()
 
 
 # --- Preview assigned counts for an agent (used by frontend) ---
@@ -323,6 +392,15 @@ def list_agent_splits(session_id: str, agent_name: str, db: Session = Depends(ge
     ).all()
     result = []
     for s in splits:
+        # Try to find the original DBF filename from LotteryFile
+        original_filename = s.lottery_code + "_" + s.draw_number + ".dbf"   # fallback
+        lf = db.query(LotteryFile).filter(
+            LotteryFile.session_id == session_id,
+            LotteryFile.lottery_name == s.lottery_code,
+            LotteryFile.draw_number == s.draw_number
+        ).first()
+        if lf:
+            original_filename = os.path.basename(lf.stored_path)   # the original filename from upload
         lt = db.query(LotteryType).filter_by(code=s.lottery_code).first()
         result.append({
             "lottery_code": s.lottery_code,
@@ -331,17 +409,28 @@ def list_agent_splits(session_id: str, agent_name: str, db: Session = Depends(ge
             "start_serial": s.start_serial,
             "end_serial": s.end_serial,
             "record_count": s.record_count,
-            "saved_file_path": s.saved_file_path,
-            "download_url": f"/api/v1/download-file/{os.path.basename(s.saved_file_path)}?session={session_id}"
+            "filename": os.path.basename(s.saved_file_path),           # stored filename
+            "original_filename": original_filename,                    # original from upload
+            "download_url": f"/api/v1/download-file/{os.path.basename(s.saved_file_path)}?session={session_id}&original_name={original_filename}",
+            "session_id": s.session_id,
         })
     return result
 
 @router.get("/download-file/{filename}")
-def download_file(filename: str, session: str):
+def download_file(
+    filename: str,
+    session: str,
+    original_name: Optional[str] = Query(None)   # optional original filename for Content-Disposition
+):
     file_path = os.path.join(STORAGE_BASE, session, "splits", filename)
     if not os.path.exists(file_path):
         raise HTTPException(404, "File not found")
-    return FileResponse(file_path, media_type="application/octet-stream", filename=filename)
+    download_name = original_name if original_name else filename
+    return FileResponse(
+        file_path,
+        media_type="application/octet-stream",
+        filename=download_name
+    )
 
 @router.get("/download-agent-zip/{session_id}/{agent_name}")
 def download_agent_zip(session_id: str, agent_name: str, db: Session = Depends(get_db)):
@@ -358,7 +447,18 @@ def download_agent_zip(session_id: str, agent_name: str, db: Session = Depends(g
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for s in splits:
             if os.path.exists(s.saved_file_path):
-                zf.write(s.saved_file_path, os.path.basename(s.saved_file_path))
+                # Determine the original filename to use inside ZIP
+                original_name = None
+                lf = db.query(LotteryFile).filter(
+                    LotteryFile.session_id == session_id,
+                    LotteryFile.lottery_name == s.lottery_code,
+                    LotteryFile.draw_number == s.draw_number
+                ).first()
+                if lf:
+                    original_name = os.path.basename(lf.stored_path)
+                if not original_name:
+                    original_name = f"{s.lottery_code}_{s.draw_number}.dbf"
+                zf.write(s.saved_file_path, original_name)
     zip_buffer.seek(0)
     return StreamingResponse(
         zip_buffer,
