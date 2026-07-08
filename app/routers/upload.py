@@ -4,13 +4,14 @@ import tempfile
 import uuid
 import logging
 from datetime import datetime, date as dateType
-from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query
+from typing import Optional
+from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Query, Form
 from sqlalchemy.orm import Session
 from app.config import MAX_UPLOAD_SIZE, EXPECTED_DBF_COUNT, ALLOWED_EXTENSIONS, STORAGE_BASE
 from app.database import get_db
 from app.utils.archive_handler import extract_archive, is_valid_archive
 from app.utils.dbf_handler import process_dbf_files
-from app.models import Session as DbSession, LotteryFile, LotteryType
+from app.models import Session as DbSession, LotteryFile, LotteryType, Order   # ← added Order
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -28,7 +29,11 @@ def extract_date_from_zip_filename(filename: str):
 
 
 @router.post("/upload-dbf-archive")
-async def upload_dbf_archive(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_dbf_archive(
+    file: UploadFile = File(...),
+    date: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+):
     """Upload a ZIP/RAR containing exactly 8 DBF files, store them, and link to a date."""
     # --- 1. Basic validation (unchanged) ---
     if not file:
@@ -63,6 +68,38 @@ async def upload_dbf_archive(file: UploadFile = File(...), db: Session = Depends
 
         # --- 4. Process DBF files (counts, serials) ---
         lottery_list = process_dbf_files(tmp_dir, expected_count=EXPECTED_DBF_COUNT)
+
+        # --- NEW: Validate draw numbers against orders for the given date ---
+        if date:
+            try:
+                selected_date = datetime.strptime(date, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid date format (use YYYY-MM-DD).")
+
+            orders = db.query(Order).filter(Order.order_date == selected_date).all()
+            if not orders:
+                raise HTTPException(status_code=400, detail=f"No orders found for {date}. Please enter orders first.")
+
+            order_draws = {o.lottery_code: o.draw_number for o in orders}
+            mismatches = []
+            for lt in lottery_list:
+                code = lt["lottery_name"]       # short code extracted from filename
+                draw = lt["draw_number"]
+                expected = order_draws.get(code)
+                if expected is None:
+                    mismatches.append(f"{code} (draw {draw}) not in today's orders")
+                elif draw != expected:
+                    mismatches.append(f"{code}: expected draw {expected}, but file has draw {draw}")
+
+            if mismatches:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Draw numbers in the uploaded files do not match the orders for {date}. "
+                        + "; ".join(mismatches)
+                    )
+                )
+        # --- END validation ---
 
         # --- 5. Persist DBF files to session storage ---
         os.makedirs(session_storage, exist_ok=True)
@@ -157,7 +194,6 @@ def get_session_lotteries(session_id: str, db: Session = Depends(get_db)):
     lotteries = db.query(LotteryFile).filter(LotteryFile.session_id == session_id).all()
     result = []
     for lf in lotteries:
-        # Optional: look up display name from LotteryType
         lt = db.query(LotteryType).filter_by(code=lf.lottery_name).first()
         result.append({
             "lottery_name": lf.lottery_name,
