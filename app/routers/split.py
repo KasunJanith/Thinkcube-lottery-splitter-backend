@@ -11,6 +11,7 @@ from app.database import get_db
 from app.models import Session, LotteryFile, AgentSplit, Agent, Assignment, Order, LotteryType
 from app.utils.dbf_splitter import split_single_lottery_for_agent, _get_serial_field
 from app.config import STORAGE_BASE
+from app.models import SpecialSplit
 
 router = APIRouter()
 
@@ -19,6 +20,179 @@ class SplitRequest(BaseModel):
     agent_name: str
     assignment_date: str
     zip_filename: Optional[str] = None
+
+class SpecialSplitRequest(BaseModel):
+    session_id: str
+    agent_name: str
+    assignment_date: str
+    counts: List[dict]   # [{"lottery_code": "ada", "count": 20}, ...]
+    label: Optional[str] = None   # optional, otherwise auto‑generated
+
+@router.post("/special-split")
+def create_special_split(request: SpecialSplitRequest, db: Session = Depends(get_db)):
+    # Validate agent and date
+    agent = db.query(Agent).filter(Agent.name == request.agent_name).first()
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    try:
+        assignment_date = datetime.strptime(request.assignment_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid date format")
+
+    # Find the daytime session
+    session = db.query(Session).filter(Session.id == request.session_id).first()
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    # Get the original agent splits for this agent/date
+    agent_splits = db.query(AgentSplit).filter(
+        AgentSplit.session_id == request.session_id,
+        AgentSplit.agent_id == agent.id
+    ).all()
+    if not agent_splits:
+        raise HTTPException(400, "No daytime splits found for this agent/date")
+
+    split_map = {sp.lottery_code: sp for sp in agent_splits}
+    results = []
+
+    for item in request.counts:
+        lottery_code = item["lottery_code"]
+        count = item["count"]
+        if count <= 0:
+            continue
+
+        original_split = split_map.get(lottery_code)
+        if not original_split:
+            raise HTTPException(400, f"No split found for lottery {lottery_code}")
+
+        # Calculate how many records are already used by existing special splits
+        existing_specials = db.query(SpecialSplit).filter(
+            SpecialSplit.agent_split_id == original_split.id
+        ).all()
+
+        # Determine the last serial used in any special split (assuming sequential allocation)
+        max_end_serial = None
+        for sp in existing_specials:
+            if max_end_serial is None or sp.end_serial > max_end_serial:
+                max_end_serial = sp.end_serial
+
+        # Read original split file, sorted by serial
+        from dbfread import DBF
+        dbf_obj = DBF(original_split.saved_file_path, encoding='utf-8')
+        serial_field = _get_serial_field(dbf_obj)
+        records = []
+        for rec in dbf_obj:
+            serial = rec[serial_field].strip()
+            records.append((serial, rec))
+        records.sort(key=lambda x: x[0])
+
+        # Filter out records already used (serial <= max_end_serial)
+        if max_end_serial:
+            available = [(s, r) for s, r in records if s > max_end_serial]
+        else:
+            available = records[:]  # all are available
+
+        if len(available) < count:
+            raise HTTPException(
+                400,
+                f"Not enough remaining records in {lottery_code} for special split. "
+                f"Requested {count}, available {len(available)}."
+            )
+
+        # Take the next `count` records
+        chunk = available[:count]
+        start_serial = chunk[0][0]
+        end_serial = chunk[-1][0]
+
+        # Generate label
+        if request.label:
+            label = request.label
+        else:
+            # Auto label: "Special Split 1", "Special Split 2" ... per original split
+            num_existing = len(existing_specials)
+            label = f"Special Split {num_existing + 1}"
+
+        # Write new DBF
+        output_dir = os.path.join(STORAGE_BASE, request.session_id, "special_splits")
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = f"{lottery_code}_{original_split.draw_number}_{agent.name}_{label.replace(' ', '_')}.dbf"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Clone structure
+        source = dbf.Table(original_split.saved_file_path)
+        source.open(dbf.READ_ONLY)
+        new = source.new(output_path)
+        new.open(dbf.READ_WRITE)
+        for _, rec in chunk:
+            row = {name: rec.get(name) for name in dbf_obj.field_names}
+            new.append(row)
+        new.close()
+        source.close()
+
+        special = SpecialSplit(
+            agent_split_id=original_split.id,
+            label=label,
+            lottery_code=lottery_code,
+            draw_number=original_split.draw_number,
+            start_serial=start_serial,
+            end_serial=end_serial,
+            record_count=len(chunk),
+            saved_file_path=output_path
+        )
+        db.add(special)
+        results.append({
+            "lottery_code": lottery_code,
+            "label": label,
+            "record_count": len(chunk),
+            "start_serial": start_serial,
+            "end_serial": end_serial
+        })
+
+    db.commit()
+    return {"status": "completed", "specials": results}
+
+@router.get("/special-splits")
+def get_special_splits(
+    agent_name: str = Query(...),
+    date: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    agent = db.query(Agent).filter(Agent.name == agent_name).first()
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    try:
+        qdate = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid date format")
+
+    # Find all special splits for this agent/date via AgentSplit
+    specials = db.query(SpecialSplit).join(AgentSplit).join(Session).filter(
+        AgentSplit.agent_id == agent.id,
+        Session.session_date == qdate
+    ).order_by(SpecialSplit.created_at).all()
+
+    result = []
+    for sp in specials:
+        lt = db.query(LotteryType).filter_by(code=sp.lottery_code).first()
+        result.append({
+            "id": sp.id,
+            "label": sp.label,
+            "lottery_code": sp.lottery_code,
+            "lottery_name": lt.name if lt else sp.lottery_code,
+            "draw_number": sp.draw_number,
+            "start_serial": sp.start_serial,
+            "end_serial": sp.end_serial,
+            "record_count": sp.record_count,
+            "filename": os.path.basename(sp.saved_file_path),
+            "session_id": sp.agent_split.session_id   # need agent_split relationship loaded
+        })
+    return result
+@router.get("/download-special-file/{filename}")
+def download_special_file(filename: str, session: str):
+    file_path = os.path.join(STORAGE_BASE, session, "special_splits", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "File not found")
+    return FileResponse(file_path, media_type="application/octet-stream", filename=filename)
 
 @router.post("/split-for-agent")
 def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):

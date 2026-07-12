@@ -114,3 +114,18 @@ class AgentWinningSplit(Base):
     total_price = Column(Float, default=0.0)
     saved_file_path = Column(String(500))
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+class SpecialSplit(Base):
+    __tablename__ = "special_splits"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_split_id = Column(Integer, ForeignKey("agent_splits.id"), nullable=False)
+    label = Column(String(50))                     # e.g., "Special Split 1"
+    lottery_code = Column(String(10))
+    draw_number = Column(String(20))
+    start_serial = Column(String(11))
+    end_serial = Column(String(11))
+    record_count = Column(Integer)
+    saved_file_path = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    agent_split = relationship("AgentSplit", backref="special_splits")    
