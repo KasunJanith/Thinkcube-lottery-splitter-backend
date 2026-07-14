@@ -3,6 +3,7 @@ import io
 import zipfile
 from datetime import datetime, date
 from typing import List, Optional
+import dbf
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from app.models import Session, LotteryFile, AgentSplit, Agent, Assignment, Orde
 from app.utils.dbf_splitter import split_single_lottery_for_agent, _get_serial_field
 from app.config import STORAGE_BASE
 from app.models import SpecialSplit
+from sqlalchemy import func
 
 router = APIRouter()
 
@@ -252,7 +254,7 @@ def split_for_agent(request: SplitRequest, db: Session = Depends(get_db)):
         # Find the DBF file
         dbf_file = db.query(LotteryFile).filter(
             LotteryFile.session_id == request.session_id,
-            LotteryFile.lottery_name == lcode,
+            func.lower(LotteryFile.lottery_name) == lcode.lower(),
             LotteryFile.draw_number == order.draw_number
         ).first()
         if not dbf_file:
@@ -435,12 +437,13 @@ def validate_upload(
         Order.order_date == selected_date
     ).all()
 
-    # Build lookup dictionaries
+    # Build lookup dictionaries with LOWERCASE keys
     uploaded_dict = {}
     for uf in uploaded_files:
-        lt = db.query(LotteryType).filter_by(code=uf.lottery_name).first()
-        uploaded_dict[uf.lottery_name] = {
-            "lottery_code": uf.lottery_name,
+        code_lower = uf.lottery_name.lower()
+        lt = db.query(LotteryType).filter_by(code=code_lower).first()
+        uploaded_dict[code_lower] = {
+            "lottery_code": code_lower,
             "lottery_name": lt.name if lt else uf.lottery_name,
             "draw_number": uf.draw_number,
             "record_count": uf.record_count,
@@ -450,9 +453,10 @@ def validate_upload(
 
     order_dict = {}
     for o in orders:
-        lt = db.query(LotteryType).filter_by(code=o.lottery_code).first()
-        order_dict[o.lottery_code] = {
-            "lottery_code": o.lottery_code,
+        code_lower = o.lottery_code.lower()
+        lt = db.query(LotteryType).filter_by(code=code_lower).first()
+        order_dict[code_lower] = {
+            "lottery_code": code_lower,
             "lottery_name": lt.name if lt else o.lottery_code,
             "draw_number": o.draw_number,
             "quantity": o.quantity
@@ -463,15 +467,15 @@ def validate_upload(
     extra_lotteries = []
 
     # Check each uploaded file against orders
-    for code, upload in uploaded_dict.items():
-        if code in order_dict:
-            order = order_dict[code]
+    for code_lower, upload in uploaded_dict.items():
+        if code_lower in order_dict:
+            order = order_dict[code_lower]
             draw_mismatch = upload["draw_number"] != order["draw_number"]
             count_mismatch = upload["record_count"] != order["quantity"]
             
             if draw_mismatch or count_mismatch:
                 mismatches.append({
-                    "lottery_code": code,
+                    "lottery_code": code_lower,
                     "lottery_name": upload["lottery_name"],
                     "ordered_draw": order["draw_number"],
                     "uploaded_draw": upload["draw_number"],
@@ -483,16 +487,16 @@ def validate_upload(
                 })
         else:
             extra_lotteries.append({
-                "lottery_code": code,
+                "lottery_code": code_lower,
                 "lottery_name": upload["lottery_name"],
                 "record_count": upload["record_count"]
             })
 
     # Check for orders without uploaded files
-    for code, order in order_dict.items():
-        if code not in uploaded_dict:
+    for code_lower, order in order_dict.items():
+        if code_lower not in uploaded_dict:
             missing_lotteries.append({
-                "lottery_code": code,
+                "lottery_code": code_lower,
                 "lottery_name": order["lottery_name"],
                 "quantity": order["quantity"]
             })

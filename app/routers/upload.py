@@ -80,10 +80,10 @@ async def upload_dbf_archive(
             if not orders:
                 raise HTTPException(status_code=400, detail=f"No orders found for {date}. Please enter orders first.")
 
-            order_draws = {o.lottery_code: o.draw_number for o in orders}
+            order_draws = {o.lottery_code.lower(): o.draw_number for o in orders}
             mismatches = []
             for lt in lottery_list:
-                code = lt["lottery_name"]       # short code extracted from filename
+                code = lt["lottery_name"].lower()   # normalize to lowercase
                 draw = lt["draw_number"]
                 expected = order_draws.get(code)
                 if expected is None:
